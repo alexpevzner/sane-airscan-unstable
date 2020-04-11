@@ -1966,6 +1966,16 @@ struct image_decoder {
 image_decoder*
 image_decoder_jpeg_new (void);
 
+/* Create TIFF image decoder
+ */
+image_decoder*
+image_decoder_tiff_new (void);
+
+/* Create BMP image decoder
+ */
+image_decoder*
+image_decoder_bmp_new (void);
+
 /* Free image decoder
  */
 static inline void
