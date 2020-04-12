@@ -20,7 +20,7 @@
 
    This file implements a SANE backend for airscan scanners. */
 
-#include "airscan.h"
+#include "../airscan.h"
 
 // gcc -o airscan-bmp airscan-bmp.c $(pkg-config --libs --cflags gtk+-3.0) -lm
 
@@ -102,7 +102,7 @@ int main (int argc, char *argv[])
 
     window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
-    fprintf(stdout, "Taille image [%dx%d]\n", win.wid, win.hei);
+    fprintf(stdout, "Taille image [%dx%dx%d]\n", win.wid, win.hei, bytes_per_pixel);
     int size_data = (win.hei * params.bytes_per_line);
     unsigned char * buffer = (unsigned char*)calloc(1, sizeof(unsigned char) * (params.bytes_per_line + 1));
     int size_buf = 0;
