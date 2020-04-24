@@ -24,6 +24,7 @@
 
 // gcc -o airscan-bmp airscan-bmp.c $(pkg-config --libs --cflags gtk+-3.0) -lm
 
+#include <endian.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -85,6 +86,16 @@ int main (int argc, char *argv[])
     fclose (fp);
 
     gtk_init (&argc, &argv);
+    window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+fprintf(stdout, "%s(%d)\n", __FUNCTION__, __LINE__);
+    gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+/* blabla */
+    printf("LITTLE_ENDIAN\n");
+#elif __BYTE_ORDER == __BIG_ENDIAN
+/* bleble */
+    printf("BIG_ENDIAN\n");
+#endif
 
     if (!strcasecmp(argv[1], "bmp"))
         decodeur = image_decoder_bmp_new ();
@@ -94,37 +105,40 @@ int main (int argc, char *argv[])
 		printf("Usage %s : %s <bmp|tiff> <filename>\n", argv[0], argv[0]);
 		exit(-1); 
 	}
-
     decodeur->begin (decodeur, (const void *)data, (size_t)size);
     decodeur->set_window (decodeur, &win);
     int bytes_per_pixel = decodeur->get_bytes_per_pixel (decodeur);
     decodeur->get_params (decodeur, &params);
 
-    window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
     fprintf(stdout, "Taille image [%dx%dx%d]\n", win.wid, win.hei, bytes_per_pixel);
-    int size_data = (win.hei * params.bytes_per_line);
-    unsigned char * buffer = (unsigned char*)calloc(1, sizeof(unsigned char) * (params.bytes_per_line + 1));
+    int size_data = (win.hei * win.wid * bytes_per_pixel);
+    unsigned char * buffer = (unsigned char*)calloc(1, sizeof(unsigned char) * (win.wid * bytes_per_pixel + 1));
     int size_buf = 0;
     unsigned char *buf = (unsigned char *)calloc(1, sizeof (unsigned char) * (size_data + 1));
     unsigned char t = *buf;
     for (i = 0; i < win.hei; i++) {
        decodeur->read_line (decodeur, buffer);
        // Reverse writing of the image.
+       size_buf += win.wid * bytes_per_pixel;
+       memcpy(&(buf[(size_data - size_buf)]), buffer, win.wid * bytes_per_pixel);
        /*
-       size_buf += params.bytes_per_line;
-       memcpy(&(buf[(size_data - size_buf)]), buffer, params.bytes_per_line);
-       */
        // Writing the image. 
-       memcpy(&(buf[size_buf]), buffer, params.bytes_per_line);
-       size_buf += params.bytes_per_line;
+       memcpy(&(buf[size_buf]), buffer, win.wid * 3);
+       size_buf += win.wid * 3;
+       * */
     }
     buf[size_buf] = 0;
+    
     GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data (buf, GDK_COLORSPACE_RGB,
-        (bytes_per_pixel == 4 ? TRUE : FALSE),
+        FALSE,
         8,
-        win.wid, win.hei, params.bytes_per_line, NULL, NULL);
-
+        win.wid, win.hei, win.wid * bytes_per_pixel, NULL, NULL);
+/*
+    gdk_pixbuf_save (pixbuf, "foo.png", "png", 
+                                      NULL,
+                                      "tEXt::Software", "testpixbuf-save",
+                                      NULL);
+*/
     scrolled_window = gtk_scrolled_window_new (NULL, NULL);
     gtk_container_add(GTK_CONTAINER (window), scrolled_window);
     
@@ -137,7 +151,6 @@ int main (int argc, char *argv[])
     gtk_container_add(GTK_CONTAINER (scrolled_window), image);
 
     gtk_widget_show_all (window);
-
     gtk_main ();
 
     return 0;
