@@ -588,6 +588,7 @@ inifile_match_name (const char *n1, const char *n2)
 /* Configuration data
  */
 conf_data conf = CONF_INIT;
+static conf_data conf_init = CONF_INIT;
 
 /* Revert conf.devices list
  */
@@ -617,6 +618,7 @@ conf_device_list_free (void)
         next = list->next;
         g_free((char*) list->name);
         g_free((char*) list->uri);
+        devid_free(list->devid);
         g_free(list);
         list = next;
     }
@@ -629,7 +631,7 @@ conf_device_list_prepend (const char *name, http_uri *uri, ID_PROTO proto)
 {
     conf_device *dev = g_new0(conf_device, 1);
     dev->name = g_strdup(name);
-    dev->uuid = uuid_hash(name);
+    dev->devid = devid_alloc();
     dev->proto = proto;
     dev->uri = uri;
     dev->next = conf.devices;
@@ -741,6 +743,22 @@ conf_load_from_ini (inifile *ini)
                     } else {
                         conf_perror(rec, "usage: model = network | hardware");
                     }
+                } else if (inifile_match_name(rec->variable, "protocol")) {
+                    if (inifile_match_name(rec->value, "auto")) {
+                        conf.proto_manual = false;
+                    } else if (inifile_match_name(rec->value, "manual")) {
+                        conf.proto_manual = true;
+                    } else {
+                        conf_perror(rec, "usage: protocol = auto | manual");
+                    }
+                } else if (inifile_match_name(rec->variable, "ws-discovery")) {
+                    if (inifile_match_name(rec->value, "fast")) {
+                        conf.fast_wsdd = true;
+                    } else if (inifile_match_name(rec->value, "full")) {
+                        conf.fast_wsdd = false;
+                    } else {
+                        conf_perror(rec, "usage: ws-discovery = fast | full");
+                    }
                 }
             } else if (inifile_match_name(rec->section, "debug")) {
                 if (inifile_match_name(rec->variable, "trace")) {
@@ -764,6 +782,12 @@ conf_load_from_ini (inifile *ini)
         default:
             break;
         }
+    }
+
+    /* Trace implies console log
+     */
+    if (conf.dbg_trace != NULL) {
+        conf.dbg_enabled = true;
     }
 }
 
@@ -856,10 +880,9 @@ conf_load (void)
     GString   *dir_list = g_string_new(NULL);
     GString   *path = g_string_new(NULL);
     char      *s;
-    conf_data init = CONF_INIT;
 
     /* Reset the configuration */
-    conf = init;
+    conf = conf_init;
 
     /* Look to configuration path in environment */
     s = getenv(CONFIG_PATH_ENV);
@@ -906,7 +929,7 @@ conf_unload (void)
 {
     conf_device_list_free();
     g_free((char*) conf.dbg_trace);
-    memset(&conf, 0, sizeof(conf));
+    conf = conf_init;
 }
 
 /* vim:ts=8:sw=4:et

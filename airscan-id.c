@@ -143,7 +143,9 @@ id_colormode_by_sane_name (const char *name)
 static id_name_table id_format_mime_name_table[] = {
     {ID_FORMAT_JPEG, "image/jpeg"},
     {ID_FORMAT_TIFF, "image/tiff"},
+    {ID_FORMAT_PNG,  "image/png"},
     {ID_FORMAT_PDF,  "application/pdf"},
+    {ID_FORMAT_DIB,  "application/dib"},
     {-1, NULL}
 };
 
@@ -162,6 +164,17 @@ ID_FORMAT
 id_format_by_mime_name (const char *name)
 {
     return id_by_name(name, strcasecmp, id_format_mime_name_table);
+}
+
+/* if_format_short_name returns short name for ID_FORMAT
+ */
+const char*
+id_format_short_name (ID_FORMAT id)
+{
+    const char *mime = id_format_mime_name(id);
+    const char *name = mime ? (strchr(mime, '/') + 1) : NULL;
+
+    return name ? name : mime;
 }
 
 /* vim:ts=8:sw=4:et

@@ -36,6 +36,7 @@ typedef struct {
     uint32_t     total_time;   /* Total elapsed time */
     ip_straddr   str_ifaddr;   /* Interface address */
     ip_straddr   str_sockaddr; /* Per-interface socket address */
+    bool         initscan;     /* Initial scan in progress */
 } wsdd_resolver;
 
 /* wsdd_finding represents zeroconf_finding for WSD
@@ -47,6 +48,7 @@ typedef struct {
     ll_head           xaddrs;       /* List of wsdd_xaddr */
     http_client       *http_client; /* HTTP client */
     ll_node           list_node;    /* In wsdd_finding_list */
+    bool              published;    /* This finding is published */
 } wsdd_finding;
 
 /* wsdd_xaddr represents device transport address
@@ -98,19 +100,22 @@ static char                wsdd_buf[65536];
 static struct sockaddr_in  wsdd_mcast_ipv4;
 static struct sockaddr_in6 wsdd_mcast_ipv6;
 static ll_head             wsdd_finding_list;
+static int                 wsdd_initscan_count;
 
 /* WS-DD Probe template
  */
 static const char *wsdd_probe_template =
     "<?xml version=\"1.0\" ?>\n"
-    "<s:Envelope xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\" xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\">\n"
+    "<s:Envelope xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\" xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:wsdp=\"http://schemas.xmlsoap.org/ws/2006/02/devprof\">\n"
     " <s:Header>\n"
     "  <a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action>\n"
     "  <a:MessageID>%s</a:MessageID>\n"
     "  <a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>\n"
     " </s:Header>\n"
     " <s:Body>\n"
-    "  <d:Probe/>\n"
+    "  <d:Probe>\n"
+    "   <d:Types>wsdp:Device</d:Types>\n"
+    "  </d:Probe>\n"
     " </s:Body>\n"
     "</s:Envelope>\n";
 
@@ -200,6 +205,27 @@ wsdd_xaddr_list_purge (ll_head *list)
     }
 }
 
+/******************** wsdd_initscan_count operations ********************/
+/* Increment wsdd_initscan_count
+ */
+static void
+wsdd_initscan_count_inc (void)
+{
+    wsdd_initscan_count ++;
+}
+
+/* Decrement wsdd_initscan_count
+ */
+static void
+wsdd_initscan_count_dec (void)
+{
+    log_assert(wsdd_log, wsdd_initscan_count > 0);
+    wsdd_initscan_count --;
+    if (wsdd_initscan_count == 0) {
+        zeroconf_finding_done(ZEROCONF_WSD);
+    }
+}
+
 /******************** wsdd_finding operations ********************/
 /* Create new wsdd_finding
  */
@@ -208,12 +234,14 @@ wsdd_finding_new (int ifindex, const char *address)
 {
     wsdd_finding *wsdd = g_new0(wsdd_finding, 1);
 
-    wsdd->address = g_strdup(address);
+    wsdd->finding.method = ZEROCONF_WSD;
     wsdd->finding.uuid = uuid_parse(address);
     if (!uuid_valid(wsdd->finding.uuid)) {
         wsdd->finding.uuid = uuid_hash(address);
     }
     wsdd->finding.ifindex = ifindex;
+
+    wsdd->address = g_strdup(address);
     ll_init(&wsdd->xaddrs);
     wsdd->http_client = http_client_new (wsdd_log, wsdd);
 
@@ -225,6 +253,10 @@ wsdd_finding_new (int ifindex, const char *address)
 static void
 wsdd_finding_free (wsdd_finding *wsdd)
 {
+    if (wsdd->published) {
+        zeroconf_finding_withdraw(&wsdd->finding);
+    }
+
     http_client_cancel(wsdd->http_client);
     http_client_free(wsdd->http_client);
 
@@ -422,7 +454,6 @@ wsdd_finding_get_metadata_callback (void *ptr, http_query *q)
         } else {
             wsdd->finding.model = g_strdup(wsdd->address);
         }
-        wsdd->finding.name = g_strdup(wsdd->finding.model);
     }
 
     /* Cleanup and exit */
@@ -447,6 +478,11 @@ DONE:
         for (endpoint = wsdd->finding.endpoints; endpoint != NULL;
             endpoint = endpoint->next) {
             log_debug(wsdd_log, "  %s", http_uri_str(endpoint->uri));
+        }
+
+        if (!wsdd->published) {
+            wsdd->published = true;
+            zeroconf_finding_publish(&wsdd->finding);
         }
     }
 }
@@ -500,7 +536,7 @@ wsdd_message_parse_endpoint (wsdd_message *msg, xml_rd *xml)
     }
 
     if (xaddrs_text != NULL) {
-        char *tok, *saveptr;
+        char              *tok, *saveptr;
         static const char *delim = "\t\n\v\f\r \x85\xA0";
 
         for (tok = strtok_r(xaddrs_text, delim, &saveptr); tok != NULL;
@@ -673,7 +709,7 @@ wsdd_resolver_read_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
         .msg_iov = &vec,
         .msg_iovlen = 1,
         .msg_control = aux,
-        .msg_controllen = sizeof(aux),
+        .msg_controllen = sizeof(aux)
     };
 
     (void) mask;
@@ -734,6 +770,11 @@ wsdd_resolver_timer_callback (void *data)
         resolver->fdpoll = NULL;
         resolver->fd = -1;
         log_debug(wsdd_log, "%s: done discovery", resolver->str_ifaddr.text);
+
+        if (resolver->initscan) {
+            resolver->initscan = false;
+            wsdd_initscan_count_dec();
+        }
     } else {
         wsdd_resolver_send_probe(resolver);
     };
@@ -796,7 +837,7 @@ wsdd_resolver_send_probe (wsdd_resolver *resolver)
 /* Create wsdd_resolver
  */
 static wsdd_resolver*
-wsdd_resolver_new (const netif_addr *addr)
+wsdd_resolver_new (const netif_addr *addr, bool initscan)
 {
     wsdd_resolver *resolver = g_new0(wsdd_resolver, 1);
     int           af = addr->ipv6 ? AF_INET6 : AF_INET;
@@ -895,6 +936,12 @@ wsdd_resolver_new (const netif_addr *addr)
 
     wsdd_resolver_send_probe(resolver);
 
+    /* Update wsdd_initscan_count */
+    resolver->initscan = initscan;
+    if (resolver->initscan) {
+        wsdd_initscan_count_inc();
+    }
+
     return resolver;
 
     /* Error: cleanup and exit */
@@ -911,6 +958,10 @@ FAIL:
 static void
 wsdd_resolver_free (wsdd_resolver *resolver)
 {
+    if (resolver->initscan) {
+        wsdd_initscan_count_dec();
+    }
+
     if (resolver->fdpoll != NULL) {
         eloop_fdpoll_free(resolver->fdpoll);
         close(resolver->fd);
@@ -1086,7 +1137,7 @@ wsdd_netif_resolver_by_ifindex (int ifindex)
 /* Update network interfaces addresses
  */
 static void
-wsdd_netif_update_addresses (void) {
+wsdd_netif_update_addresses (bool initscan) {
     netif_addr *addr_list = netif_addr_get();
     netif_addr *addr;
     netif_diff diff = netif_diff_compute(wsdd_netif_addr_list, addr_list);
@@ -1116,7 +1167,7 @@ wsdd_netif_update_addresses (void) {
 
     for (addr = wsdd_netif_addr_list; addr != NULL; addr = addr->next) {
         if (addr->data == NULL) {
-            addr->data = wsdd_resolver_new(addr);
+            addr->data = wsdd_resolver_new(addr, initscan);
         }
     }
 }
@@ -1129,7 +1180,7 @@ wsdd_netif_notifier_callback (void *data)
     (void) data;
 
     log_debug(wsdd_log, "netif event");
-    wsdd_netif_update_addresses();
+    wsdd_netif_update_addresses(false);
 }
 
 /******************** Initialization and cleanup ********************/
@@ -1153,7 +1204,7 @@ wsdd_start_stop_callback (bool start)
         }
 
         /* Update netif addresses */
-        wsdd_netif_update_addresses();
+        wsdd_netif_update_addresses(true);
     } else {
         /* Stop multicast reception */
         if (wsdd_fdpoll_ipv4 != NULL) {
@@ -1178,13 +1229,14 @@ wsdd_init (void)
     /* Initialize logging */
     wsdd_log = log_ctx_new("WSDD");
 
-    if (!conf.discovery) {
-        log_debug(NULL, "devices discovery disabled");
-        return SANE_STATUS_GOOD;
-    }
-
     /* Initialize wsdd_finding_list */
     ll_init(&wsdd_finding_list);
+
+    /* All for now, if WS-Discovery is disabled */
+    if (!conf.discovery) {
+        log_debug(wsdd_log, "devices discovery disabled");
+        return SANE_STATUS_GOOD;
+    }
 
     /* Create IPv4/IPv6 multicast addresses */
     wsdd_mcast_ipv4.sin_family = AF_INET;
@@ -1235,6 +1287,7 @@ wsdd_cleanup (void)
     }
 
     netif_addr_free(wsdd_netif_addr_list);
+    wsdd_netif_addr_list = NULL;
 
     if (wsdd_mcsock_ipv4 >= 0) {
         close(wsdd_mcsock_ipv4);
@@ -1245,6 +1298,8 @@ wsdd_cleanup (void)
         close(wsdd_mcsock_ipv6);
         wsdd_mcsock_ipv6 = -1;
     }
+
+    log_assert(wsdd_log, ll_empty(&wsdd_finding_list));
 
     if (wsdd_log != NULL) {
         log_ctx_free(wsdd_log);

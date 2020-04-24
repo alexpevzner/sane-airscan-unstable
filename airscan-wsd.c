@@ -49,8 +49,21 @@ static const xml_ns wsd_ns_wr[] = {
  */
 typedef struct {
     proto_handler proto; /* Base class */
-    bool          exif;  /* "exif" format supported */
-    bool          jfif;  /* "jfif" format supported */
+
+    /* Supported formats: JPEG variants */
+    bool          exif;
+    bool          jfif;
+
+    /* Supported formats: TIFF variabls */
+    bool          tiff_single_uncompressed;
+    bool          tiff_single_g4;
+    bool          tiff_single_g3mh;
+    bool          tiff_single_jpeg_tn2;
+
+    /* Other formats */
+    bool          pdf_a;
+    bool          png;
+    bool          dib;
 } proto_handler_wsd;
 
 /* Free ESCL protocol handler
@@ -80,7 +93,7 @@ wsd_make_request_header (const proto_ctx *ctx, xml_wr *xml, const char *action)
     xml_wr_enter(xml, "s:Header");
     xml_wr_add_text(xml, "a:MessageID", u.text);
     //xml_wr_add_text(xml, "a:To", WSD_ADDR_ANONYMOUS);
-    xml_wr_add_text(xml, "a:To", http_uri_str(ctx->base_uri));
+    xml_wr_add_text(xml, "a:To", http_uri_str(ctx->base_uri_nozone));
     xml_wr_enter(xml, "a:ReplyTo");
     xml_wr_add_text(xml, "a:Address", WSD_ADDR_ANONYMOUS);
     xml_wr_leave(xml);
@@ -140,14 +153,16 @@ wsd_devcaps_parse_description (devcaps *caps, xml_rd *xml)
  */
 static error
 wsd_devcaps_parse_formats (proto_handler_wsd *wsd,
-        devcaps *caps, xml_rd *xml, unsigned int *formats)
+        devcaps *caps, xml_rd *xml, unsigned int *formats_out)
 {
     error        err = NULL;
     unsigned int level = xml_rd_depth(xml);
     size_t       prefixlen = strlen(xml_rd_node_path(xml));
+    unsigned int formats = 0;
 
     (void) caps;
 
+    /* Decode supported formats */
     while (!xml_rd_end(xml)) {
         const char *path = xml_rd_node_path(xml) + prefixlen;
 
@@ -155,20 +170,58 @@ wsd_devcaps_parse_formats (proto_handler_wsd *wsd,
             const char *v = xml_rd_node_value(xml);
 
             if (!strcmp(v, "jfif")) {
-                *formats |= 1 << ID_FORMAT_JPEG;
                 wsd->jfif = true;
             } else if (!strcmp(v, "exif")) {
-                *formats |= 1 << ID_FORMAT_JPEG;
                 wsd->exif = true;
+
+            } else if (!strcmp(v, "tiff-single-uncompressed")) {
+                wsd->tiff_single_uncompressed = true;
+            } else if (!strcmp(v, "tiff-single-g4")) {
+                wsd->tiff_single_g4 = true;
+            } else if (!strcmp(v, "tiff-single-g3mh")) {
+                wsd->tiff_single_g3mh = true;
+            } else if (!strcmp(v, "tiff-single-jpeg-tn2")) {
+                wsd->tiff_single_jpeg_tn2 = true;
             } else if (!strcmp(v, "pdf-a")) {
-                *formats |= 1 << ID_FORMAT_PDF;
+                wsd->pdf_a = true;
+            } else if (!strcmp(v, "png")) {
+                wsd->png = true;
+            } else if (!strcmp(v, "dib")) {
+                wsd->dib = true;
             }
         }
 
         xml_rd_deep_next(xml, level);
     }
 
-    if (((*formats) & DEVCAPS_FORMATS_SUPPORTED) == 0) {
+    /* Set formats bits */
+    if (wsd->jfif || wsd->exif) {
+        formats |= 1 << ID_FORMAT_JPEG;
+    }
+
+    if (wsd->pdf_a) {
+        formats |= 1 << ID_FORMAT_PDF;
+    }
+
+    if (wsd->png) {
+        formats |= 1 << ID_FORMAT_PNG;
+    }
+
+    if (wsd->tiff_single_g4 || wsd->tiff_single_g3mh) {
+        formats |= 1 << ID_FORMAT_TIFF;
+    }
+
+    if ((formats & DEVCAPS_FORMATS_SUPPORTED) == 0) {
+        /* These used as last resort */
+        if (wsd->tiff_single_jpeg_tn2 || wsd->tiff_single_uncompressed) {
+            formats |= 1 << ID_FORMAT_TIFF;
+        } else if (wsd->dib) {
+            formats |= 1 << ID_FORMAT_DIB;
+        }
+    }
+
+    *formats_out = formats;
+    if (((formats) & DEVCAPS_FORMATS_SUPPORTED) == 0) {
         err = ERROR("no supported image formats");
     }
 
@@ -600,6 +653,7 @@ wsd_scan_query (const proto_ctx *ctx)
     xml_wr                  *xml = xml_wr_begin("s:Envelope", wsd_ns_wr);
     const char              *source = NULL;
     const char              *colormode = NULL;
+    const char              *format = NULL;
     static const char       *sides_simplex[] = {"scan:MediaFront", NULL};
     static const char       *sides_duplex[] = {"scan:MediaFront", "scan:MediaBack", NULL};
     const char              **sides;
@@ -640,14 +694,52 @@ wsd_scan_query (const proto_ctx *ctx)
 
     xml_wr_enter(xml, "scan:DocumentParameters");
 
-    // FIXME -- JPEG hardcoded for now
-    if (wsd->jfif) {
-        xml_wr_add_text(xml, "scan:Format", "jfif"); // FIXME
-    } else if (wsd->exif) {
-        xml_wr_add_text(xml, "scan:Format", "exif"); // FIXME
-    } else {
-        log_internal_error(ctx->log);
+    switch (ctx->params.format) {
+    case ID_FORMAT_JPEG:
+        if (wsd->jfif) {
+            format = "jfif";
+        } else if (wsd->exif) {
+            format = "exif";
+        }
+        break;
+
+    case ID_FORMAT_TIFF:
+        if (wsd->tiff_single_g4) {
+            format = "tiff-single-g4";
+        } else if (wsd->tiff_single_g3mh) {
+            format = "tiff-single-g3mh";
+        } else if (wsd->tiff_single_jpeg_tn2) {
+            format = "tiff-single-jpeg-tn2";
+        } else if (wsd->tiff_single_uncompressed) {
+            format = "tiff-single-uncompressed";
+        }
+        break;
+
+    case ID_FORMAT_PNG:
+        if (wsd->png) {
+            format = "png";
+        }
+        break;
+
+    case ID_FORMAT_PDF:
+        if (wsd->pdf_a) {
+            format = "pdf-a";
+        }
+        break;
+
+    case ID_FORMAT_DIB:
+        if (wsd->dib) {
+            format = "dib";
+        }
+        break;
+
+    case ID_FORMAT_UNKNOWN:
+    case NUM_ID_FORMAT:
+        break;
     }
+
+    log_assert(ctx->log, format != NULL);
+    xml_wr_add_text(xml, "scan:Format", format);
 
     xml_wr_add_text(xml, "scan:ImagesToTransfer", "0");
 

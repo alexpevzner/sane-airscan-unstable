@@ -342,7 +342,9 @@ typedef enum {
     ID_FORMAT_UNKNOWN = -1,
     ID_FORMAT_JPEG,
     ID_FORMAT_TIFF,
+    ID_FORMAT_PNG,
     ID_FORMAT_PDF,
+    ID_FORMAT_DIB,
 
     NUM_ID_FORMAT
 } ID_FORMAT;
@@ -357,6 +359,27 @@ id_format_mime_name (ID_FORMAT id);
  */
 ID_FORMAT
 id_format_by_mime_name (const char *name);
+
+/* if_format_short_name returns short name for ID_FORMAT
+ */
+const char*
+id_format_short_name (ID_FORMAT id);
+
+/******************** Device ID ********************/
+/* Allocate unique device ID
+ */
+unsigned int
+devid_alloc (void);
+
+/* Free device ID
+ */
+void
+devid_free (unsigned int id);
+
+/* Initialize device ID allocator
+ */
+void
+devid_init (void);
 
 /******************** UUID utilities ********************/
 /* Type uuid represents a random UUID string.
@@ -413,11 +436,11 @@ uuid_equal (uuid u1, uuid u2)
  */
 typedef struct conf_device conf_device;
 struct conf_device {
-    const char  *name; /* Device name */
-    uuid        uuid;  /* uuid_hash(name) */
-    ID_PROTO    proto; /* Protocol to use */
-    http_uri    *uri;  /* Device URI, parsed; NULL if device disabled */
-    conf_device *next; /* Next device in the list */
+    unsigned int devid; /* Device ident */
+    const char   *name; /* Device name */
+    ID_PROTO     proto; /* Protocol to use */
+    http_uri     *uri;  /* Device URI, parsed; NULL if device disabled */
+    conf_device  *next; /* Next device in the list */
 };
 
 /* Backend configuration
@@ -428,9 +451,11 @@ typedef struct {
     conf_device *devices;         /* Manually configured devices */
     bool        discovery;        /* Scanners discovery enabled */
     bool        model_is_netname; /* Use network name instead of model */
+    bool        proto_manual;     /* Manual protocol switch */
+    bool        fast_wsdd;        /* Fast WS-Discovery */
 } conf_data;
 
-#define CONF_INIT { false, NULL, NULL, true, true }
+#define CONF_INIT { false, NULL, NULL, true, true, false, true }
 
 extern conf_data conf;
 
@@ -791,6 +816,14 @@ http_uri_set_path (http_uri *uri, const char *path);
 void
 http_uri_fix_ipv6_zone (http_uri *uri, int ifindex);
 
+/* Strip zone suffix from literal IPv6 host address
+ *
+ * If address is not IPv6 or doesn't have zone suffix, it is
+ * not changed
+ */
+void
+http_uri_strip_zone_suffux (http_uri *uri);
+
 /* Make sure URI's path ends with the slash character
  */
 void
@@ -834,7 +867,6 @@ void
 http_data_queue_free (http_data_queue *queue);
 
 /* Push item into the http_data_queue.
- * If queue is not empty, it will be purged
  */
 void
 http_data_queue_push (http_data_queue *queue, http_data *data);
@@ -916,6 +948,16 @@ http_query*
 http_query_new_relative(http_client *client,
         const http_uri *base_uri, const char *path,
         const char *method, char *body, const char *content_type);
+
+/* For this particular query override on-error callback, previously
+ * set by http_client_onerror()
+ *
+ * If canllback is NULL, the completion callback, specified on a
+ * http_query_submit() call, will be used even in a case of
+ * transport error.
+ */
+void
+http_query_onerror (http_query *q, void (*onerror)(void *ptr, error err));
 
 /* Submit the query.
  *
@@ -1440,7 +1482,9 @@ enum {
 /* Supported image formats
  */
 #define DEVCAPS_FORMATS_SUPPORTED       \
-    ((1 << ID_FORMAT_JPEG))
+    ((1 << ID_FORMAT_JPEG) |            \
+     (1 << ID_FORMAT_PNG)  |            \
+     (1 << ID_FORMAT_DIB))
 
 /* Supported color modes
  *
@@ -1571,6 +1615,10 @@ SANE_Status
 devopt_get_option (devopt *opt, SANE_Int option, void *value);
 
 /******************** ZeroConf (device discovery) ********************/
+/* zeroconf_device represents a single device
+ */
+typedef struct zeroconf_device zeroconf_device;
+
 /* zeroconf_endpoint represents a device endpoint
  */
 typedef struct zeroconf_endpoint zeroconf_endpoint;
@@ -1609,12 +1657,17 @@ typedef enum {
  */
 typedef struct {
     ZEROCONF_METHOD   method;     /* Discovery method */
-    const char        *name;      /* Device name */
+    const char        *name;      /* Network-unique name, NULL for WSD */
     const char        *model;     /* Model name */
     uuid              uuid;       /* Device UUID */
     int               ifindex;    /* Network interface index */
     zeroconf_endpoint *endpoints; /* List of endpoints */
-    ll_node           list_node;  /* Should not be used by discovery providers*/
+
+    /* The following fields are reserved for zeroconf core
+     * and should not be used by discovery providers
+     */
+    zeroconf_device   *device;    /* Device the finding points to */
+    ll_node           list_node;  /* Node in device's list of findings */
 } zeroconf_finding;
 
 /* Publish the zeroconf_finding.
@@ -1646,8 +1699,8 @@ zeroconf_finding_done (ZEROCONF_METHOD method);
 /* zeroconf_devinfo represents a device information
  */
 typedef struct {
-    uuid              uuid;       /* Device UUID */
-    const char        *name;      /* Device name */
+    const char        *ident;     /* Unique ident */
+    const char        *name;      /* Human-friendly name */
     zeroconf_endpoint *endpoints; /* Device endpoints */
 } zeroconf_devinfo;
 
@@ -1821,7 +1874,6 @@ typedef enum {
     PROTO_OP_SCAN,    /* New scan */
     PROTO_OP_LOAD,    /* Load image */
     PROTO_OP_CHECK,   /* Check device status */
-    PROTO_OP_CANCEL,  /* Cancel current job */
     PROTO_OP_CLEANUP, /* Cleanup after scan */
     PROTO_OP_FINISH   /* Finish scanning */
 } PROTO_OP;
@@ -1834,6 +1886,7 @@ typedef struct {
     int           x_res, y_res; /* X/Y resolution */
     ID_SOURCE     src;          /* Desired source */
     ID_COLORMODE  colormode;    /* Desired color mode */
+    ID_FORMAT     format;       /* Image format */
 } proto_scan_params;
 
 /* proto_ctx represents request context
@@ -1845,6 +1898,7 @@ typedef struct {
     const devcaps        *devcaps;        /* Device capabilities */
     http_client          *http;           /* HTTP client for sending requests */
     http_uri             *base_uri;       /* HTTP base URI for protocol */
+    http_uri             *base_uri_nozone;/* base_uri without IPv6 zone */
     proto_scan_params    params;          /* Scan parameters */
     const char           *location;       /* Image location */
     unsigned int         images_received; /* Total count of received images */
@@ -1971,10 +2025,15 @@ image_decoder_jpeg_new (void);
 image_decoder*
 image_decoder_tiff_new (void);
 
-/* Create BMP image decoder
+/* Create PNG image decoder
  */
 image_decoder*
-image_decoder_bmp_new (void);
+image_decoder_png_new (void);
+
+/* Create DIB image decoder
+ */
+image_decoder*
+image_decoder_dib_new (void);
 
 /* Free image decoder
  */
@@ -2157,6 +2216,18 @@ math_rand_max (uint32_t max);
  */
 uint32_t
 math_rand_range (uint32_t min, uint32_t max);
+
+/* Count nonzero bits in 32-bit integer
+ */
+static inline unsigned int
+math_popcount (unsigned int n)
+{
+    unsigned int count = (n & 0x55555555) + ((n >> 1) & 0x55555555);
+    count = (count & 0x33333333) + ((count >> 2) & 0x33333333);
+    count = (count & 0x0F0F0F0F) + ((count >> 4) & 0x0F0F0F0F);
+    count = (count & 0x00FF00FF) + ((count >> 8) & 0x00FF00FF);
+    return (count & 0x0000FFFF) + ((count >> 16) & 0x0000FFFF);
+}
 
 /******************** Logging ********************/
 /* Initialize logging

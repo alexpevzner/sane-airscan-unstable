@@ -32,15 +32,16 @@ enum {
  *     |    | submit PROTO_OP_SCAN                             |
  *     |    V                                                  |
  *     |  SCANNING----------                                   |
- *     |    |              | async cancel request received     |
+ *     |    |              | async cancel request received,    |
+ *     |    |              | dev->stm_cancel_event signalled   |
  *     |    |              V                                   |
  *     |    |           CANCEL_REQ                             |
- *     |    |              | stm_cancel_event callback         |
+ *     |    |              | dev->stm_cancel_event callback    |
  *     |    |              |                                   |
  *     |    |              +------                             |
- *     |    |              |     | PROTO_OP_SCAN still pending |
- *     |    |              |     |                             |
- *     |    |              |  CANCEL_DELAYED                   |
+ *     |    | reached      |     | PROTO_OP_SCAN still pending |
+ *     |    | CLEANUP      |     V                             |
+ *     |    |<----------------CANCEL_DELAYED                   |
  *     |    |              |     |  | PROTO_OP_SCAN failed     |
  *     |    |              V     V  -----------------          |
  *     |    |           CANCEL_SENT                 |          |
@@ -52,7 +53,7 @@ enum {
  *     |    V              |            |           |          |
  *     |  CLEANUP          |            |           |          |
  *     |    |              |            |           |          |
- *     |    V              |            |           |          |
+ *     |    V              V            V           V          |
  *     ---DONE<--------------------------------------          |
  *          |                                                  |
  *          V                                                  |
@@ -103,9 +104,11 @@ struct device {
     SANE_Word            job_skip_x;          /* How much pixels to skip, */
     SANE_Word            job_skip_y;          /*    from left and top */
 
+    /* Image decoders */
+    image_decoder        *decoders[NUM_ID_FORMAT]; /* Decoders by format */
+
     /* Read machinery */
     SANE_Bool            read_non_blocking;  /* Non-blocking I/O mode */
-    image_decoder        *read_decoder_jpeg; /* JPEG decoder */
     pollable             *read_pollable;     /* Signalled when read won't
                                                 block */
     http_data_queue      *read_queue;        /* Queue of received images */
@@ -192,7 +195,6 @@ device_new (zeroconf_devinfo *devinfo)
 
     g_cond_init(&dev->stm_cond);
 
-    dev->read_decoder_jpeg = image_decoder_jpeg_new();
     dev->read_pollable = pollable_new();
     dev->read_queue = http_data_queue_new();
 
@@ -207,6 +209,8 @@ device_new (zeroconf_devinfo *devinfo)
 static void
 device_free (device *dev)
 {
+    int i;
+
     /* Remove device from table */
     log_debug(dev->log, "removed from device table");
     g_ptr_array_remove(device_table, dev);
@@ -228,11 +232,19 @@ device_free (device *dev)
     devopt_cleanup(&dev->opt);
 
     http_client_free(dev->proto_ctx.http);
+    http_uri_free(dev->proto_ctx.base_uri_nozone);
     g_free((char*) dev->proto_ctx.location);
 
     g_cond_clear(&dev->stm_cond);
 
-    image_decoder_free(dev->read_decoder_jpeg);
+    for (i = 0; i < NUM_ID_FORMAT; i ++) {
+        image_decoder *decoder = dev->decoders[i];
+        if (decoder != NULL) {
+            image_decoder_free(decoder);
+            log_debug(dev->log, "closed decoder: %s", id_format_short_name(i));
+        }
+    }
+
     http_data_queue_free(dev->read_queue);
     pollable_free(dev->read_pollable);
 
@@ -281,7 +293,7 @@ device_find_by_ident (const char *ident)
 
     for (i = 0; i < device_table->len; i ++) {
         device *dev = g_ptr_array_index(device_table, i);
-        if (!strcmp(dev->devinfo->uuid.text, ident)) {
+        if (!strcmp(dev->devinfo->ident, ident)) {
             return dev;
         }
     }
@@ -350,7 +362,6 @@ device_proto_op_name (device *dev, PROTO_OP op)
     case PROTO_OP_SCAN:    return "PROTO_OP_SCAN";
     case PROTO_OP_LOAD:    return "PROTO_OP_LOAD";
     case PROTO_OP_CHECK:   return "PROTO_OP_CHECK";
-    case PROTO_OP_CANCEL:  return "PROTO_OP_CANCEL";
     case PROTO_OP_CLEANUP: return "PROTO_OP_CLEANUP";
     case PROTO_OP_FINISH:  return "PROTO_OP_FINISH";
     }
@@ -373,7 +384,6 @@ device_proto_op_submit (device *dev, PROTO_OP op,
     case PROTO_OP_SCAN:    func = dev->proto_ctx.proto->scan_query; break;
     case PROTO_OP_LOAD:    func = dev->proto_ctx.proto->load_query; break;
     case PROTO_OP_CHECK:   func = dev->proto_ctx.proto->status_query; break;
-    case PROTO_OP_CANCEL:  func = dev->proto_ctx.proto->cancel_query; break;
     case PROTO_OP_CLEANUP: func = dev->proto_ctx.proto->cleanup_query; break;
     case PROTO_OP_FINISH:  log_internal_error(dev->log); break;
     }
@@ -414,7 +424,6 @@ device_proto_op_decode (device *dev, PROTO_OP op)
     case PROTO_OP_SCAN:    func = dev->proto_ctx.proto->scan_decode; break;
     case PROTO_OP_LOAD:    func = dev->proto_ctx.proto->load_decode; break;
     case PROTO_OP_CHECK:   func = dev->proto_ctx.proto->status_decode; break;
-    case PROTO_OP_CANCEL:  func = device_proto_dummy_decode; break;
     case PROTO_OP_CLEANUP: func = device_proto_dummy_decode; break;
     case PROTO_OP_FINISH:  log_internal_error(dev->log); break;
     }
@@ -485,6 +494,10 @@ device_probe_endpoint (device *dev, zeroconf_endpoint *endpoint)
     dev->endpoint_current = endpoint;
     dev->proto_ctx.base_uri = endpoint->uri;
 
+    http_uri_free(dev->proto_ctx.base_uri_nozone);
+    dev->proto_ctx.base_uri_nozone = http_uri_clone(endpoint->uri);
+    http_uri_strip_zone_suffux(dev->proto_ctx.base_uri_nozone);
+
     /* Fetch device capabilities */
     device_proto_devcaps_submit (dev, device_scanner_capabilities_callback);
 }
@@ -494,8 +507,10 @@ device_probe_endpoint (device *dev, zeroconf_endpoint *endpoint)
 static void
 device_scanner_capabilities_callback (void *ptr, http_query *q)
 {
-    error err   = NULL;
-    device *dev = ptr;
+    error        err   = NULL;
+    device       *dev = ptr;
+    int          i;
+    unsigned int formats;
 
     /* Check request status */
     err = http_query_error(q);
@@ -513,6 +528,43 @@ device_scanner_capabilities_callback (void *ptr, http_query *q)
 
     devcaps_dump(dev->log, &dev->opt.caps);
     devopt_set_defaults(&dev->opt);
+
+    /* Setup decoders */
+    formats = 0;
+    for (i = 0; i < NUM_ID_SOURCE; i ++) {
+        devcaps_source *src = dev->opt.caps.src[i];
+        if (src != NULL) {
+            formats |= src->formats;
+        }
+    }
+
+    formats &= DEVCAPS_FORMATS_SUPPORTED;
+    for (i = 0; i < NUM_ID_FORMAT; i ++) {
+        if ((formats & (1 << i)) != 0) {
+            switch (i) {
+            case ID_FORMAT_JPEG:
+                dev->decoders[i] = image_decoder_jpeg_new();
+                break;
+
+            case ID_FORMAT_TIFF:
+                dev->decoders[i] = image_decoder_tiff_new();
+                break;
+
+            case ID_FORMAT_PNG:
+                dev->decoders[i] = image_decoder_png_new();
+                break;
+
+            case ID_FORMAT_DIB:
+                dev->decoders[i] = image_decoder_dib_new();
+                break;
+
+            default:
+                log_internal_error(dev->log);
+            }
+
+            log_debug(dev->log, "new decoder: %s", id_format_short_name(i));
+        }
+    }
 
     /* Cleanup and exit */
 DONE:
@@ -573,13 +625,14 @@ device_stm_state_working (device *dev)
     return state > DEVICE_STM_IDLE && state < DEVICE_STM_DONE;
 }
 
-/* Check if CANCEL request was sent
+/* Check if CANCEL request was sent to device
  */
 static bool
 device_stm_state_cancel_sent (device *dev)
 {
     switch (device_stm_state_get(dev)) {
     case DEVICE_STM_CANCEL_SENT:
+    case DEVICE_STM_CANCEL_JOB_DONE:
     case DEVICE_STM_CANCEL_REQ_DONE:
         return true;
 
@@ -593,8 +646,12 @@ device_stm_state_cancel_sent (device *dev)
 static void
 device_stm_state_set (device *dev, DEVICE_STM_STATE state)
 {
-    if (dev->stm_state != state) {
-        log_debug(dev->log, "state=%s", device_stm_state_name(state));
+    DEVICE_STM_STATE old_state = device_stm_state_get(dev);
+
+    if (old_state != state) {
+        log_debug(dev->log, "%s->%s",
+            device_stm_state_name(old_state), device_stm_state_name(state));
+
         __atomic_store_n(&dev->stm_state, state, __ATOMIC_SEQ_CST);
         g_cond_broadcast(&dev->stm_cond);
 
@@ -629,13 +686,24 @@ device_stm_cancel_perform (device *dev, SANE_Status status)
     proto_ctx *ctx = &dev->proto_ctx;
 
     device_job_set_status(dev, status);
-    if (ctx->location != NULL) {
+    if (ctx->location != NULL && !device_stm_state_cancel_sent(dev)) {
+        if (ctx->params.src == ID_SOURCE_PLATEN &&
+            ctx->images_received > 0) {
+            /* If we are not expecting more images, skip cancel
+             * and simple wait until job is done
+             */
+            device_stm_state_set(dev, DEVICE_STM_CANCEL_REQ_DONE);
+        } else {
+            /* Otherwise, perform a normal cancel operation
+             */
+            device_stm_state_set(dev, DEVICE_STM_CANCEL_SENT);
 
-        device_stm_state_set(dev, DEVICE_STM_CANCEL_SENT);
-        log_assert(dev->log, dev->stm_cancel_query == NULL);
-        dev->stm_cancel_query = ctx->proto->cancel_query(ctx);
-        http_query_submit(dev->stm_cancel_query, device_stm_cancel_callback);
+            log_assert(dev->log, dev->stm_cancel_query == NULL);
+            dev->stm_cancel_query = ctx->proto->cancel_query(ctx);
 
+            http_query_onerror(dev->stm_cancel_query, NULL);
+            http_query_submit(dev->stm_cancel_query, device_stm_cancel_callback);
+        }
         return true;
     }
 
@@ -715,8 +783,8 @@ device_stm_op_callback (void *ptr, http_query *q)
     /* Update job status */
     device_job_set_status(dev, result.status);
 
-    /* If CANCEL was sent, and next operation is cleanup or
-     * current operation is CHECK, finish the job
+    /* If CANCEL was sent, and next operation is CLEANUP or
+     * current operation is CHECK, FINISH the job
      */
     if (device_stm_state_cancel_sent(dev)) {
         if (result.next == PROTO_OP_CLEANUP ||
@@ -743,19 +811,20 @@ device_stm_op_callback (void *ptr, http_query *q)
         return;
     }
 
+    /* Handle switch to PROTO_OP_CLEANUP state */
+    if (result.next == PROTO_OP_CLEANUP) {
+        device_stm_state_set(dev, DEVICE_STM_CLEANUP);
+    }
+
     /* Handle delayed cancellation */
     if (device_stm_state_get(dev) == DEVICE_STM_CANCEL_DELAYED) {
         if (!device_stm_cancel_perform(dev, SANE_STATUS_CANCELLED)) {
+            /* Finish the job, if we has not yet reached cancellable
+             * state
+             */
             device_stm_state_set(dev, DEVICE_STM_DONE);
+            return;
         }
-        return;
-    }
-
-    /* Update state, if needed */
-    if (result.next == PROTO_OP_CANCEL) {
-        device_stm_state_set(dev, DEVICE_STM_CANCEL_SENT);
-    } else if (result.next == PROTO_OP_CLEANUP) {
-        device_stm_state_set(dev, DEVICE_STM_CLEANUP);
     }
 
     /* Handle delay */
@@ -835,6 +904,35 @@ device_geom_compute (SANE_Fixed tl, SANE_Fixed br,
     return geom;
 }
 
+/* Choose image format
+ */
+static ID_FORMAT
+device_choose_format (device *dev, devcaps_source *src)
+{
+    unsigned int formats = src->formats;
+
+    formats &= DEVCAPS_FORMATS_SUPPORTED;
+
+    if ((formats & (1 << ID_FORMAT_PNG)) != 0) {
+        return ID_FORMAT_PNG;
+    }
+
+    if ((formats & (1 << ID_FORMAT_JPEG)) != 0) {
+        return ID_FORMAT_JPEG;
+    }
+
+    if ((formats & (1 << ID_FORMAT_DIB)) != 0) {
+        return ID_FORMAT_DIB;
+    }
+
+    if ((formats & (1 << ID_FORMAT_TIFF)) != 0) {
+        return ID_FORMAT_TIFF;
+    }
+
+    log_internal_error(dev->log);
+    return ID_FORMAT_UNKNOWN;
+}
+
 /* Request scan
  */
 static void
@@ -868,6 +966,7 @@ device_stm_start_scan (device *dev)
     params->y_res = y_resolution;
     params->src = dev->opt.src;
     params->colormode = dev->opt.colormode;
+    params->format = device_choose_format(dev, src);
 
     /* Dump parameters */
     log_trace(dev->log, "==============================");
@@ -883,6 +982,8 @@ device_stm_start_scan (device *dev)
     log_trace(dev->log, "  image Y offset: %d", params->y_off);
     log_trace(dev->log, "  x_resolution:   %d", params->x_res);
     log_trace(dev->log, "  y_resolution:   %d", params->y_res);
+    log_trace(dev->log, "  format:         %s",
+            id_format_short_name(params->format));
     log_trace(dev->log, "");
 
     /* Submit a request */
@@ -1205,8 +1306,10 @@ device_read_next (device *dev)
     error           err;
     size_t          line_capacity;
     SANE_Parameters params;
-    image_decoder   *decoder = dev->read_decoder_jpeg;
+    image_decoder   *decoder = dev->decoders[dev->proto_ctx.params.format];
     int             wid, hei;
+
+    log_assert(dev->log, decoder != NULL);
 
     dev->read_image = http_data_queue_pull(dev->read_queue);
     if (dev->read_image == NULL) {
@@ -1316,6 +1419,9 @@ static SANE_Status
 device_read_decode_line (device *dev)
 {
     const SANE_Int n = dev->read_line_num;
+    image_decoder  *decoder = dev->decoders[dev->proto_ctx.params.format];
+
+    log_assert(dev->log, decoder != NULL);
 
     if (n == dev->opt.params.lines) {
         return SANE_STATUS_EOF;
@@ -1324,8 +1430,7 @@ device_read_decode_line (device *dev)
     if (n < dev->read_skip_lines || n >= dev->read_line_end) {
         memset(dev->read_line_buf, 0xff, dev->opt.params.bytes_per_line);
     } else {
-        error err = image_decoder_read_line(dev->read_decoder_jpeg,
-                dev->read_line_buf);
+        error err = image_decoder_read_line(decoder, dev->read_line_buf);
 
         if (err != NULL) {
             log_debug(dev->log, ESTRING(err));
@@ -1344,10 +1449,13 @@ device_read_decode_line (device *dev)
 SANE_Status
 device_read (device *dev, SANE_Byte *data, SANE_Int max_len, SANE_Int *len_out)
 {
-    SANE_Int     len = 0;
-    SANE_Status  status = SANE_STATUS_GOOD;
+    SANE_Int      len = 0;
+    SANE_Status   status = SANE_STATUS_GOOD;
+    image_decoder *decoder = dev->decoders[dev->proto_ctx.params.format];
 
     *len_out = 0; /* Must return 0, if status is not GOOD */
+
+    log_assert(dev->log, decoder != NULL);
 
     /* Check device state */
     if ((dev->flags & DEVICE_READING) == 0) {
@@ -1423,7 +1531,7 @@ DONE:
 
     /* Scan and read finished - cleanup device */
     dev->flags &= ~(DEVICE_SCANNING | DEVICE_READING);
-    image_decoder_reset(dev->read_decoder_jpeg);
+    image_decoder_reset(decoder);
     if (dev->read_image != NULL) {
         http_data_unref(dev->read_image);
         dev->read_image = NULL;

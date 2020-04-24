@@ -189,7 +189,7 @@ devcaps_dump (log_ctx *log, devcaps *caps)
         }
     }
 
-    log_trace(log, "  Sources:    %s", buf->str);
+    log_trace(log, "  Sources:          %s", buf->str);
 
     ID_SOURCE id_src;
     for (id_src = (ID_SOURCE) 0; id_src < NUM_ID_SOURCE; id_src ++) {
@@ -239,6 +239,19 @@ devcaps_dump (log_ctx *log, devcaps *caps)
         }
 
         log_trace(log, "    Color modes: %s", buf->str);
+
+        g_string_truncate(buf, 0);
+
+        for (i = 0; i < NUM_ID_FORMAT; i ++) {
+            if ((src->formats & (1 << i)) != 0) {
+                if (buf->len != 0) {
+                    g_string_append(buf, ", ");
+                }
+                g_string_append(buf, id_format_short_name(i));
+            }
+        }
+
+        log_trace(log, "    Formats:     %s", buf->str);
     }
 
     g_string_free(buf, TRUE);
