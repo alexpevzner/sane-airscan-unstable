@@ -40,6 +40,11 @@ netif_addr_get (void)
             continue;
         }
 
+        /* skip interface if it is not configured */
+        if (ifp->ifa_addr == NULL) {
+            continue;
+        }
+
         /* Obtain interface index. Skip address, if it failed */
         int idx = if_nametoindex(ifp->ifa_name);
         if (idx <= 0) {
