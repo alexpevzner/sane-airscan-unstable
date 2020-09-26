@@ -133,9 +133,16 @@ eloop_poll_func (struct pollfd *ufds, unsigned int nfds, int timeout,
 
     eloop_poll_restart = false;
 
-    pthread_mutex_unlock(&eloop_mutex);
+    /* We are still holding eloop_mutex, and we have to. That is
+     * because of a limitation in avahi:
+     * avahi_simple_poll_iterate calls:
+     *   avahi_simple_poll_prepare which assigns idx to the AvahiWatch
+     *   avahi_simple_poll_run witch calls this function
+     *   avahi_simple_poll_dispatch, which expects idx to be set.
+     * If we unlock in here, eloop_fdpoll_new might be called, causing
+     * this assert in avahi_simple_poll_dispatch:
+     *   assert(w->idx >= 0); */
     rc = poll(ufds, nfds, timeout);
-    pthread_mutex_lock(&eloop_mutex);
 
     if (eloop_poll_restart) {
         errno = ERESTART;
@@ -151,6 +158,7 @@ static void*
 eloop_thread_func (void *data)
 {
     int i;
+    useconds_t usec = 100;
 
     (void) data;
 
@@ -164,7 +172,11 @@ eloop_thread_func (void *data)
 
     do {
         eloop_call_execute();
-        i = avahi_simple_poll_iterate(eloop_poll, -1);
+        i = avahi_simple_poll_iterate(eloop_poll, 1);
+
+        pthread_mutex_unlock(&eloop_mutex);
+        usleep(usec);
+        pthread_mutex_lock(&eloop_mutex);
     } while (i == 0 || (i < 0 && (errno == EINTR || errno == ERESTART)));
 
     for (i = eloop_start_stop_callbacks_count - 1; i >= 0; i --) {
