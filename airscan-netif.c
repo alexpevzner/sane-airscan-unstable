@@ -14,8 +14,10 @@
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#ifdef HAVE_NETLINK_H
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#endif
 #include <net/if.h>
 #include <sys/socket.h>
 
@@ -420,6 +422,11 @@ struct netif_notifier {
 static void
 netif_notifier_read_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
 {
+#ifndef HAVE_NETLINK_H
+  (void)fd;
+  (void)data;
+  (void)mask;
+#else
     static uint8_t  buf[16384];
     int             rc;
     struct nlmsghdr *p;
@@ -471,6 +478,7 @@ netif_notifier_read_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
             return;
         }
     }
+#endif
 }
 
 /* Create netif_notifier
@@ -502,6 +510,11 @@ netif_notifier_free (netif_notifier *notifier)
 static void
 netif_start_stop_callback (bool start)
 {
+#ifndef HAVE_NETLINK_H
+    (void)start;
+    (void)netif_rtnetlink_fdpoll;
+    (void)netif_notifier_read_callback;
+#else
     if (start) {
         netif_rtnetlink_fdpoll = eloop_fdpoll_new(netif_rtnetlink_sock,
             netif_notifier_read_callback, NULL);
@@ -510,6 +523,7 @@ netif_start_stop_callback (bool start)
         eloop_fdpoll_free(netif_rtnetlink_fdpoll);
         netif_rtnetlink_fdpoll = NULL;
     }
+#endif
 }
 
 /* Initialize network interfaces monitoring
@@ -517,10 +531,11 @@ netif_start_stop_callback (bool start)
 SANE_Status
 netif_init (void)
 {
+    ll_init(&netif_notifier_list);
+
+#ifdef HAVE_NETLINK_H
     struct sockaddr_nl addr;
     int                rc;
-
-    ll_init(&netif_notifier_list);
 
     /* Create AF_NETLINK socket */
     netif_rtnetlink_sock = socket(AF_NETLINK,
@@ -542,6 +557,7 @@ netif_init (void)
         close(netif_rtnetlink_sock);
         return SANE_STATUS_IO_ERROR;
     }
+#endif
 
     /* Initialize netif_ifaddrs */
     if (getifaddrs(&netif_ifaddrs) < 0) {

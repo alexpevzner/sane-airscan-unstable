@@ -58,6 +58,10 @@
  */
 #define CONFIG_DEFAULT_SOCKET_DIR       "/var/run"
 
+#ifdef __linux__
+#define HAVE_NETLINK_H
+#endif
+
 /******************** Forward declarations ********************/
 /* log_ctx represents logging context
  */
