@@ -940,11 +940,14 @@ wsdd_resolver_read_callback (int fd, void *data, ELOOP_FDPOLL_MASK mask)
             cmsg->cmsg_type == IPV6_PKTINFO) {
             struct in6_pktinfo *pkt = (struct in6_pktinfo*) CMSG_DATA(cmsg);
             ifindex = pkt->ipi6_ifindex;
-        } else if (cmsg->cmsg_level == IPPROTO_IP &&
+        }
+#ifdef IP_PKTINFO
+        else if (cmsg->cmsg_level == IPPROTO_IP &&
             cmsg->cmsg_type == IP_PKTINFO) {
             struct in_pktinfo *pkt = (struct in_pktinfo*) CMSG_DATA(cmsg);
             ifindex = pkt->ipi_ifindex;
         }
+#endif
     }
 
     str_from = ip_straddr_from_sockaddr((struct sockaddr*) &from, true);
@@ -1102,6 +1105,7 @@ wsdd_resolver_new (const netif_addr *addr, bool initscan)
             goto FAIL;
         }
 
+#ifdef IP_PKTINFO
         rc = setsockopt(resolver->fd, IPPROTO_IP, IP_PKTINFO,
                 &yes, sizeof(yes));
 
@@ -1110,6 +1114,7 @@ wsdd_resolver_new (const netif_addr *addr, bool initscan)
                     strerror(errno));
             goto FAIL;
         }
+#endif
 
         /* Note: error is not a problem here */
         setsockopt(resolver->fd, IPPROTO_IP, IP_MULTICAST_LOOP,
@@ -1404,12 +1409,14 @@ wsdd_mcsock_open (bool ipv6)
             goto FAIL;
         }
     } else {
+#ifdef IP_PKTINFO
         rc = setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &yes, sizeof(yes));
         if (rc < 0) {
             log_debug(wsdd_log, "setsockopt(%s, IP_PKTINFO): %s",
                     af_name, strerror(errno));
             goto FAIL;
         }
+#endif
     }
 
     /* Bind socket to WSDD multicast port; group membership
@@ -1471,12 +1478,20 @@ wsdd_mcast_update_membership (int fd, netif_addr *addr, bool add)
                     strerror(errno));
         }
     } else {
+#ifdef IP_PKTINFO
         struct ip_mreqn  mreq4;
+#else
+        struct ip_mreq  mreq4;
+#endif
 
         memset(&mreq4, 0, sizeof(mreq4));
         mreq4.imr_multiaddr = wsdd_mcast_ipv4.sin_addr;
+#ifdef IP_PKTINFO
         mreq4.imr_address = addr->ip.v4;
         mreq4.imr_ifindex = addr->ifindex;
+#else
+        mreq4.imr_interface = addr->ip.v4;
+#endif
 
         opt = add ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP;
         rc = setsockopt(fd, IPPROTO_IP, opt, &mreq4, sizeof(mreq4));
