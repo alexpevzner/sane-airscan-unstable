@@ -20,8 +20,12 @@
 /******************** Static variables *********************/
 static AvahiSimplePoll *eloop_poll;
 static pthread_t eloop_thread;
+static pthread_t eloop_wakeup_thread;
 static pthread_mutex_t eloop_mutex;
+static pthread_mutex_t wakeup_mutex;
+static pthread_mutex_t wakeup_mutex2;
 static bool eloop_thread_running;
+static bool should_exit_wakeup_thread;
 static ll_head eloop_call_pending_list;
 static bool eloop_poll_restart;
 
@@ -47,6 +51,8 @@ eloop_init (void)
     pthread_mutexattr_t attr;
     bool                attr_initialized = false;
     bool                mutex_initialized = false;
+    bool                wakeup_mutex_initialized = false;
+    bool                wakeup_mutex2_initialized = false;
     SANE_Status         status = SANE_STATUS_NO_MEM;
 
     ll_init(&eloop_call_pending_list);
@@ -66,6 +72,18 @@ eloop_init (void)
     }
 
     mutex_initialized = true;
+
+    if (pthread_mutex_init(&wakeup_mutex, &attr)) {
+        goto DONE;
+    }
+
+    wakeup_mutex_initialized = true;
+
+    if (pthread_mutex_init(&wakeup_mutex2, &attr)) {
+        goto DONE;
+    }
+
+    wakeup_mutex2_initialized = true;
 
     /* Create AvahiSimplePoll */
     eloop_poll = avahi_simple_poll_new();
@@ -88,6 +106,14 @@ DONE:
         pthread_mutex_destroy(&eloop_mutex);
     }
 
+    if (status != SANE_STATUS_GOOD && wakeup_mutex_initialized) {
+        pthread_mutex_destroy(&wakeup_mutex);
+    }
+
+    if (status != SANE_STATUS_GOOD && wakeup_mutex2_initialized) {
+        pthread_mutex_destroy(&wakeup_mutex2);
+    }
+
     return status;
 }
 
@@ -99,6 +125,9 @@ eloop_cleanup (void)
     if (eloop_poll != NULL) {
         avahi_simple_poll_free(eloop_poll);
         pthread_mutex_destroy(&eloop_mutex);
+        pthread_mutex_unlock(&wakeup_mutex);
+        pthread_mutex_destroy(&wakeup_mutex);
+        pthread_mutex_destroy(&wakeup_mutex2);
         eloop_poll = NULL;
     }
 }
@@ -142,7 +171,9 @@ eloop_poll_func (struct pollfd *ufds, unsigned int nfds, int timeout,
      * If we unlock in here, eloop_fdpoll_new might be called, causing
      * this assert in avahi_simple_poll_dispatch:
      *   assert(w->idx >= 0); */
+    pthread_mutex_unlock(&wakeup_mutex2);
     rc = poll(ufds, nfds, timeout);
+    pthread_mutex_lock(&wakeup_mutex2);
 
     if (eloop_poll_restart) {
         errno = ERESTART;
@@ -163,6 +194,7 @@ eloop_thread_func (void *data)
     (void) data;
 
     pthread_mutex_lock(&eloop_mutex);
+    pthread_mutex_lock(&wakeup_mutex2);
 
     for (i = 0; i < eloop_start_stop_callbacks_count; i ++) {
         eloop_start_stop_callbacks[i](true);
@@ -172,7 +204,7 @@ eloop_thread_func (void *data)
 
     do {
         eloop_call_execute();
-        i = avahi_simple_poll_iterate(eloop_poll, 1);
+        i = avahi_simple_poll_iterate(eloop_poll, -1);
 
         pthread_mutex_unlock(&eloop_mutex);
         usleep(usec);
@@ -184,8 +216,33 @@ eloop_thread_func (void *data)
     }
 
     pthread_mutex_unlock(&eloop_mutex);
+    pthread_mutex_unlock(&wakeup_mutex2);
 
     return NULL;
+}
+
+static void*
+eloop_wakeup_thread_func (void *data)
+{
+    (void)data;
+    useconds_t usec = 100;
+    for (;;) {
+        if (__atomic_load_n(&should_exit_wakeup_thread, __ATOMIC_SEQ_CST)) {
+            return NULL;
+        }
+    /* We use two locks to constrain how often we send wakeups to
+     * the avahi loop. We are able to lock wakeup_mutex when the
+     * main threads wants to wakeup the loop. We are able to lock
+     * wakeup_mutex2, when the avahi loop is blocked on poll.
+     * We lock wakeup_mutex2 first, to avoid holding wakeup_mutex for
+     * too long. */
+        pthread_mutex_lock(&wakeup_mutex2);
+        pthread_mutex_lock(&wakeup_mutex);
+        avahi_simple_poll_wakeup(eloop_poll);
+        pthread_mutex_unlock(&wakeup_mutex);
+        pthread_mutex_unlock(&wakeup_mutex2);
+        usleep(usec);
+    }
 }
 
 /* Start event loop thread.
@@ -197,6 +254,12 @@ eloop_thread_start (void)
     useconds_t usec = 100;
 
     rc = pthread_create(&eloop_thread, NULL, eloop_thread_func, NULL);
+    if (rc != 0) {
+        log_panic(NULL, "pthread_create: %s", strerror(rc));
+    }
+
+    pthread_mutex_lock(&wakeup_mutex);
+    rc = pthread_create(&eloop_wakeup_thread, NULL, eloop_wakeup_thread_func, NULL);
     if (rc != 0) {
         log_panic(NULL, "pthread_create: %s", strerror(rc));
     }
@@ -214,6 +277,9 @@ void
 eloop_thread_stop (void)
 {
     if (__atomic_load_n(&eloop_thread_running, __ATOMIC_SEQ_CST)) {
+        __atomic_store_n(&should_exit_wakeup_thread, true, __ATOMIC_SEQ_CST);
+        pthread_mutex_unlock(&wakeup_mutex);
+        pthread_join(eloop_wakeup_thread, NULL);
         avahi_simple_poll_quit(eloop_poll);
         pthread_join(eloop_thread, NULL);
         __atomic_store_n(&eloop_thread_running, false, __ATOMIC_SEQ_CST);
@@ -225,7 +291,9 @@ eloop_thread_stop (void)
 void
 eloop_mutex_lock (void)
 {
+    pthread_mutex_unlock(&wakeup_mutex);
     pthread_mutex_lock(&eloop_mutex);
+    pthread_mutex_lock(&wakeup_mutex);
 }
 
 /* Release event loop mutex
@@ -241,7 +309,9 @@ eloop_mutex_unlock (void)
 void
 eloop_cond_wait (pthread_cond_t *cond)
 {
+    pthread_mutex_unlock(&wakeup_mutex);
     pthread_cond_wait(cond, &eloop_mutex);
+    pthread_mutex_lock(&wakeup_mutex);
 }
 
 /* Get AvahiPoll that runs in event loop thread
